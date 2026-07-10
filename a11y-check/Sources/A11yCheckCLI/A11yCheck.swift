@@ -1,9 +1,27 @@
+/*
+   Copyright 2026 CVS Health and/or one of its affiliates
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+ */
+
 import ArgumentParser
 import Foundation
 import A11yCheckCore
 
 @main
 struct A11yCheck: ParsableCommand {
+    static let toolVersion = "0.3.0"
+
     static let configuration = CommandConfiguration(
         commandName: "a11y-check",
         abstract: "SwiftUI Accessibility Checker — static analysis for iOS accessibility issues.",
@@ -24,11 +42,13 @@ struct A11yCheck: ParsableCommand {
           a11y-check . --per-view
           a11y-check . --no-trend
           a11y-check . --format sarif > results.sarif
+          a11y-check . --report
+          a11y-check . --report --report-dir build/a11y
           a11y-check . --badge > badge.svg
           a11y-check . --watch
           a11y-check --generate-docs > RULES.md
         """,
-        version: "0.3.0 (\(buildCommit) \(buildDate))"
+        version: "\(toolVersion) (\(buildCommit) \(buildDate))"
     )
 
     @Argument(help: "File or directory paths to analyze.")
@@ -91,6 +111,12 @@ struct A11yCheck: ParsableCommand {
     @Option(name: .long, help: "Compare results against a previous JSON report file. Only new issues are shown.")
     var diffReport: String?
 
+    @Flag(name: .long, help: "Write the full artifact set (SARIF, JSON, HTML, findings snapshot, summary manifest, badge) to the report folder (default: .a11y/swift/).")
+    var report = false
+
+    @Option(name: .long, help: "Report folder root used by --report (default: .a11y inside the analyzed directory). Implies --report.")
+    var reportDir: String?
+
     @Flag(name: .long, help: "Generate Markdown rule documentation to stdout.")
     var generateDocs = false
 
@@ -116,6 +142,24 @@ struct A11yCheck: ParsableCommand {
         // Discover asset catalog colors for contrast checking
         let projectRoot = resolvePath(paths.first ?? ".")
         registry.assetColors = AssetCatalogParser.discoverColors(in: projectRoot)
+
+        // Analyzed root directory (parent dir when the first path is a file) —
+        // anchors the report folder, trend history, and findings path relativization.
+        let analysisRoot: String = {
+            var root = projectRoot
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: root, isDirectory: &isDir), !isDir.boolValue {
+                root = (root as NSString).deletingLastPathComponent
+            }
+            return (root as NSString).standardizingPath
+        }()
+
+        // --report / --report-dir: resolve the artifact folder (.a11y/swift/ by default).
+        let reportPlatformDir: String? = (report || reportDir != nil) ? {
+            let root = reportDir.map(resolvePath)
+                ?? (analysisRoot as NSString).appendingPathComponent(ReportLayout.defaultRootName)
+            return ReportLayout.platformDirectory(reportRoot: root)
+        }() : nil
 
         // Handle --list-rules
         if listRules {
@@ -192,16 +236,25 @@ struct A11yCheck: ParsableCommand {
                 filePaths: filePaths
             )
             let baselineData = Baseline.from(diagnostics: allDiagnostics, score: preScore.score)
-            try baselineData.save(to: resolvePath(paths.first ?? "."))
+            if let platformDir = reportPlatformDir {
+                try FileManager.default.createDirectory(atPath: platformDir, withIntermediateDirectories: true)
+                try baselineData.save(toPath: ReportLayout.baselinePath(platformDir: platformDir))
+            } else {
+                try baselineData.save(to: resolvePath(paths.first ?? "."))
+            }
             print("Baseline saved with \(allDiagnostics.count) issues (score: \(String(format: "%.1f", preScore.score)))")
             print("Future runs with --baseline will only report new issues.")
             return
         }
 
-        // Apply baseline filter
+        // Apply baseline filter — prefer the .a11y/swift/ folder form when reporting,
+        // falling back to the legacy top-level .a11y-baseline.json.
         if baseline {
             let searchDir = resolvePath(paths.first ?? ".")
-            if let baselineData = Baseline.load(from: searchDir) {
+            let folderBaseline = reportPlatformDir.flatMap {
+                Baseline.load(atPath: ReportLayout.baselinePath(platformDir: $0))
+            }
+            if let baselineData = folderBaseline ?? Baseline.load(from: searchDir) {
                 let before = allDiagnostics.count
                 allDiagnostics = baselineData.filterNew(diagnostics: allDiagnostics)
                 let suppressed = before - allDiagnostics.count
@@ -270,16 +323,26 @@ struct A11yCheck: ParsableCommand {
                 print(formatter.format(allDiagnostics, relativeTo: basePath, score: updatedScore))
 
                 // Record trend after fix
+                var postFixTrendEntries: [TrendTracker.Entry] = []
                 if trend {
-                    var trendDir = resolvePath(paths.first ?? ".")
-                    var isDirFlag: ObjCBool = false
-                    if FileManager.default.fileExists(atPath: trendDir, isDirectory: &isDirFlag), !isDirFlag.boolValue {
-                        trendDir = (trendDir as NSString).deletingLastPathComponent
-                    }
-                    let tracker = TrendTracker(directory: trendDir)
+                    let tracker = makeTrendTracker(analysisRoot: analysisRoot, reportPlatformDir: reportPlatformDir)
+                    postFixTrendEntries = tracker.load().entries
                     let trendOutput = tracker.formatTrend(currentScore: updatedScore)
                     tracker.record(score: updatedScore)
                     print(trendOutput)
+                }
+
+                // Write report artifacts reflecting the post-fix state
+                if let platformDir = reportPlatformDir {
+                    let result = try writeReportArtifacts(
+                        diagnostics: allDiagnostics,
+                        score: updatedScore,
+                        registry: registry,
+                        trendEntries: postFixTrendEntries,
+                        analysisRoot: analysisRoot,
+                        platformDir: platformDir
+                    )
+                    printReportSummary(result, platformDir: platformDir, score: updatedScore, trendRecorded: trend)
                 }
 
                 let errorCount = allDiagnostics.filter { $0.severity == .error }.count
@@ -296,18 +359,30 @@ struct A11yCheck: ParsableCommand {
         var trendEntries: [TrendTracker.Entry] = []
         var tracker: TrendTracker? = nil
         if trend {
-            var trendDir = resolvePath(paths.first ?? ".")
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: trendDir, isDirectory: &isDir), !isDir.boolValue {
-                trendDir = (trendDir as NSString).deletingLastPathComponent
-            }
-            let t = TrendTracker(directory: trendDir)
+            let t = makeTrendTracker(analysisRoot: analysisRoot, reportPlatformDir: reportPlatformDir)
             tracker = t
             trendEntries = t.load().entries
         }
 
+        // --report: materialize the full artifact set before any stdout output
+        // so artifacts are written even when the run exits non-zero.
+        var reportResult: ReportWriter.Result? = nil
+        if let platformDir = reportPlatformDir {
+            reportResult = try writeReportArtifacts(
+                diagnostics: allDiagnostics,
+                score: score,
+                registry: registry,
+                trendEntries: trendEntries,
+                analysisRoot: analysisRoot,
+                platformDir: platformDir
+            )
+        }
+
         // Generate badge if requested (early return — no other output)
         if badge {
+            if let result = reportResult, let platformDir = reportPlatformDir {
+                printReportSummary(result, platformDir: platformDir, score: score, trendRecorded: false)
+            }
             let generator = BadgeGenerator()
             print(generator.generate(score: score))
             return
@@ -356,6 +431,11 @@ struct A11yCheck: ParsableCommand {
             tracker.record(score: score)
         }
 
+        // --report: concise summary on stderr (keeps stdout parseable for --format json/sarif)
+        if let result = reportResult, let platformDir = reportPlatformDir {
+            printReportSummary(result, platformDir: platformDir, score: score, trendRecorded: tracker != nil)
+        }
+
         // Exit with error code if there are errors (skip in watch mode)
         let errorCount = allDiagnostics.filter { $0.severity == .error }.count
         if errorCount > 0 && !watch {
@@ -391,6 +471,83 @@ struct A11yCheck: ParsableCommand {
         }
     }
 
+    /// Build the trend tracker, relocated into the report folder when --report is
+    /// active. Seeds the new scores.json from a legacy .a11y-scores.json (copy,
+    /// not move) so v0.3.0 history is not silently lost.
+    private func makeTrendTracker(analysisRoot: String, reportPlatformDir: String?) -> TrendTracker {
+        if let platformDir = reportPlatformDir {
+            try? FileManager.default.createDirectory(atPath: platformDir, withIntermediateDirectories: true)
+            _ = try? ReportLayout.migrateLegacyScores(analysisRoot: analysisRoot, platformDir: platformDir)
+            return TrendTracker(directory: platformDir, fileName: ReportLayout.scoresFileName)
+        }
+        return TrendTracker(directory: analysisRoot)
+    }
+
+    /// Write all --report artifacts, surfacing non-fatal warnings on stderr.
+    /// A write failure is fatal: artifacts are the point of the run.
+    private func writeReportArtifacts(
+        diagnostics: [A11yDiagnostic],
+        score: A11yScore,
+        registry: RuleRegistry,
+        trendEntries: [TrendTracker.Entry],
+        analysisRoot: String,
+        platformDir: String
+    ) throws -> ReportWriter.Result {
+        let toolInfo = ReportWriter.ToolInfo(
+            name: "a11y-check",
+            version: Self.toolVersion,
+            buildCommit: buildCommit,
+            buildDate: buildDate
+        )
+        do {
+            let result = try ReportWriter().write(
+                diagnostics: diagnostics,
+                score: score,
+                allRules: registry.rules,
+                enabledRules: registry.enabledRules,
+                trendEntries: trendEntries,
+                toolInfo: toolInfo,
+                analysisRoot: analysisRoot,
+                outputDirectory: platformDir
+            )
+            for warning in result.warnings {
+                printNote("a11y-check: warning: \(warning)")
+            }
+            return result
+        } catch let exit as ExitCode {
+            throw exit
+        } catch {
+            printError("Failed to write report artifacts to \(platformDir): \(error.localizedDescription)")
+            throw ExitCode(1)
+        }
+    }
+
+    private func printReportSummary(
+        _ result: ReportWriter.Result,
+        platformDir: String,
+        score: A11yScore,
+        trendRecorded: Bool
+    ) {
+        // scores.json is written by the trend tracker rather than the ReportWriter
+        let artifactCount = result.artifacts.count + (trendRecorded ? 1 : 0)
+        var line = "a11y-check: wrote \(artifactCount) artifacts to \(displayPath(platformDir))/"
+        line += " — score \(String(format: "%.1f", score.score)) (\(score.grade))"
+        line += ", \(score.totalErrors) errors, \(score.totalWarnings) warnings"
+        if let delta = result.delta {
+            line += " — vs previous run: \(delta.new) new, \(delta.fixed) fixed, \(delta.persisting) persisting"
+        }
+        printNote(line)
+    }
+
+    /// Shorten an absolute path to be cwd-relative for display.
+    private func displayPath(_ path: String) -> String {
+        let cwd = FileManager.default.currentDirectoryPath
+        if path.hasPrefix(cwd + "/") {
+            return String(path.dropFirst(cwd.count + 1))
+        }
+        return path
+    }
+
     private func resolvePath(_ path: String) -> String {
         if path.hasPrefix("/") {
             return path
@@ -401,6 +558,10 @@ struct A11yCheck: ParsableCommand {
 
     private func printError(_ message: String) {
         FileHandle.standardError.write(Data("\u{001B}[31merror: \(message)\u{001B}[0m\n".utf8))
+    }
+
+    private func printNote(_ message: String) {
+        FileHandle.standardError.write(Data((message + "\n").utf8))
     }
 }
 
