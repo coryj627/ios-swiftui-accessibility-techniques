@@ -95,3 +95,4 @@ iOSInjectionProject/
 # a11y-check
 .a11y-scores.json
 .a11y-baseline.json
+.a11y/

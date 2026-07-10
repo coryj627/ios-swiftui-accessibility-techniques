@@ -351,6 +351,65 @@ a11y-check Sources/ --format json > baseline-report.json
 a11y-check Sources/ --diff-report baseline-report.json
 ```
 
+## Report folder (`--report`)
+
+Write the complete artifact set to a `.a11y/swift/` folder in one run — no more one `--format` per invocation with manual redirection:
+
+```bash
+a11y-check . --report
+```
+
+produces:
+
+```
+.a11y/
+└── swift/
+    ├── report.sarif      # SARIF — GitHub code scanning ingestion
+    ├── report.json       # machine-readable report
+    ├── report.html       # human-readable report
+    ├── findings.json     # fingerprinted snapshot — run-over-run tracking anchor
+    ├── summary.json      # run manifest (metadata + rollups + delta)
+    ├── scores.json       # trend history (relocated .a11y-scores.json)
+    └── badge.svg         # SVG score badge
+```
+
+Details:
+
+- **Same diagnostics as a normal run.** Artifacts reflect the filtered set the run would otherwise output — config exclusions, `--only`, `--diff`, and `--lines` are all honored. `report.sarif`, `report.json`, and `report.html` are byte-equivalent to the corresponding `--format` stdout output for the same inputs.
+- **Run-over-run tracking.** `findings.json` is deterministic — stably ordered, timestamp-free, with file paths relative to the analyzed root — so two identical scans produce byte-identical snapshots. Each run diffs against the previous snapshot and writes a `new` / `fixed` / `persisting` rollup into `summary.json` (`delta` is omitted on the first run). All volatile fields (timestamp, git SHA) live only in `summary.json`.
+- **`summary.json` manifest** includes a schema version, tool version + build commit, the git SHA of the analyzed tree, timestamp, score/grade, counts by severity / rule / WCAG criterion, files analyzed, and the delta rollup.
+- **`--report-dir <path>`** overrides the default `.a11y` root (and implies `--report`). The `swift/` subfolder namespaces artifacts so the layout composes with a multi-platform `.a11y/` convention (`web/`, `flutter/`, …).
+- **Normal output is unchanged.** Your chosen `--format` still streams to stdout; the one-line report summary goes to stderr, so `a11y-check . --report --format json > out.json` stays valid JSON. Exit-code behavior (`--min-score`, error count) is also unchanged, and artifacts are written even when the run exits non-zero — CI can always upload them.
+- **Trend and baseline relocate** into the folder when `--report` is active: history is read from/recorded to `.a11y/swift/scores.json` (seeded automatically from a legacy top-level `.a11y-scores.json`, which is left in place), and `--baseline-save` / `--baseline` use `.a11y/swift/baseline.json`, falling back to the legacy `.a11y-baseline.json` when the folder form is absent.
+- **Gitignore it** (recommended): add `.a11y/` to your `.gitignore`. Teams that want to commit reports (e.g. to diff `findings.json` in PRs) can simply not ignore it — nothing in the folder requires being untracked.
+
+### CI recipe
+
+```yaml
+# GitHub Actions
+- name: Run a11y-check
+  run: a11y-check Sources/ --report || true   # keep going; gate below
+
+- name: Upload SARIF to code scanning
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: .a11y/swift/report.sarif
+
+- name: Publish HTML report
+  uses: actions/upload-artifact@v4
+  with:
+    name: a11y-report
+    path: .a11y/swift/report.html
+
+- name: Gate on new findings
+  run: |
+    new=$(jq '.delta.new // 0' .a11y/swift/summary.json)
+    echo "New accessibility findings: $new"
+    test "$new" -eq 0
+```
+
+To gate on score instead, use `--min-score` directly: `a11y-check Sources/ --report --min-score 80`.
+
 ## Rule documentation generator
 
 Generate a complete Markdown reference for all rules:
@@ -366,7 +425,7 @@ The generated document includes a summary table, grouping by WCAG criterion, and
 | Option | Description |
 |--------|-------------|
 | `paths` | File or directory paths to analyze (default: `.`) |
-| `--format` | Output format: `terminal` (default), `json`, `xcode`, `html` |
+| `--format` | Output format: `terminal` (default), `json`, `xcode`, `html`, `sarif` |
 | `--only` | Minimum severity: `info`, `warning`, or `error` |
 | `--disable` | Comma-separated rule IDs to disable |
 | `--config` | Path to `.a11ycheck.yml` config file (auto-detected if not specified) |
@@ -385,6 +444,8 @@ The generated document includes a summary table, grouping by WCAG criterion, and
 | `--badge` | Generate an SVG score badge to stdout |
 | `--watch` | Watch for file changes and re-run analysis automatically |
 | `--diff-report` | Compare against a previous JSON report — only new issues shown |
+| `--report` | Write the full artifact set (SARIF, JSON, HTML, findings snapshot, summary manifest, badge) to `.a11y/swift/` |
+| `--report-dir` | Report folder root used by `--report` (default: `.a11y` inside the analyzed directory). Implies `--report` |
 | `--generate-docs` | Generate Markdown rule documentation to stdout |
 
 ## Configuration file
@@ -540,7 +601,7 @@ Check your version with:
 
 ```bash
 a11y-check --version
-# Example output: 0.3.0 (abc1234 2026-05-04)
+# Example output: 0.4.0 (abc1234 2026-07-09)
 ```
 
 ### Troubleshooting
@@ -829,3 +890,19 @@ env -u SDKROOT brew install --HEAD cvs-health/ios-swiftui-accessibility-techniqu
 ## License
 
 Apache License 2.0 — see the [repository root LICENSE](../LICENSE).
+
+----
+
+Copyright 2026 CVS Health and/or one of its affiliates
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+[http://www.apache.org/licenses/LICENSE-2.0]()
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+See the License for the specific language governing permissions and
+limitations under the License.

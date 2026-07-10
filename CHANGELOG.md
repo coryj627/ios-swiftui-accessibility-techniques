@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [26.8] - 2026-06-10
+## [26.8] - 2026-07-09
 
 ### iOS App
 
@@ -17,6 +17,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 #### Added
 
 - `button-group-missing-container-label` rule (warning, WCAG 1.3.1) — flags HStack/VStack/LazyVGrid/LazyHStack containers of 2+ Buttons that have a visible group label (preceding Text) but are missing `.accessibilityElement(children: .contain)` and/or `.accessibilityLabel()`, so VoiceOver users hear the group context when navigating to the buttons
+- `--report` flag ([#25](https://github.com/cvs-health/ios-swiftui-accessibility-techniques/issues/25)) — materializes the full artifact set into a `.a11y/swift/` folder in one run: `report.sarif`, `report.json`, `report.html`, `badge.svg`, a deterministic fingerprinted `findings.json` snapshot for run-over-run tracking, and a `summary.json` manifest (tool/build/git metadata, score, counts by severity/rule/WCAG criterion, and a new/fixed/persisting delta vs the previous run). `--report-dir <path>` overrides the `.a11y` root. Trend history and baseline relocate to `.a11y/swift/scores.json` / `.a11y/swift/baseline.json` when reporting, with automatic seeding from and read fallback to the legacy top-level `.a11y-scores.json` / `.a11y-baseline.json`. Stdout output, filters (`--only`, `--diff`, `--lines`, config exclusions), and exit-code behavior are unchanged; artifacts are written even when the run exits non-zero so CI can always upload them
+
+#### Changed
+
+- a11y-check version bumped to 0.4.0, now defined in a single `A11yCheckVersion` constant shared by the CLI `--version` output, `summary.json` manifest, and SARIF driver metadata
 
 ## [26.7] - 2026-05-19
 
