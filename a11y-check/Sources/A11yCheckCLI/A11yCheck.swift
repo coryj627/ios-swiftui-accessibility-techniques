@@ -20,7 +20,7 @@ import A11yCheckCore
 
 @main
 struct A11yCheck: ParsableCommand {
-    static let toolVersion = "0.3.0"
+    static let toolVersion = A11yCheckVersion.current
 
     static let configuration = CommandConfiguration(
         commandName: "a11y-check",

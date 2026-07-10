@@ -601,7 +601,7 @@ Check your version with:
 
 ```bash
 a11y-check --version
-# Example output: 0.3.0 (abc1234 2026-05-04)
+# Example output: 0.4.0 (abc1234 2026-07-09)
 ```
 
 ### Troubleshooting
